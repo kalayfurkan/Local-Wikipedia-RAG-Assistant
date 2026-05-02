@@ -8,21 +8,17 @@
 # ============================================================
 
 import os
-import re
-import sqlite3
 import requests
 import chromadb
 from config import (
     OLLAMA_BASE_URL, OLLAMA_LLM_MODEL, OLLAMA_EMBED_MODEL,
-    SQLITE_DB_PATH, PEOPLE, PLACES,
+    PEOPLE, PLACES,
 )
 
 # ── ChromaDB ayarları ────────────────────────────────────────
 CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
 COLLECTION_NAME = "wiki_rag"
-TOP_K = 5            # Üretici'ye verilecek nihai chunk sayısı
-HYBRID_POOL_SIZE = 20   # Dense ve BM25'ten alınan ham aday havuzu (her biri)
-RRF_K = 60           # Reciprocal Rank Fusion sabiti (literatür default)
+TOP_K = 5   # Retrieve edilecek chunk sayısı
 
 
 # ════════════════════════════════════════════════════════════
@@ -193,170 +189,69 @@ def _embed_query(text: str) -> list[float]:
     return resp.json()["embeddings"][0]
 
 
-# ── BM25 (SQLite FTS5) için stopwords ve tokenizer ───────────
-_STOPWORDS = {
-    "a","an","the","of","in","on","at","to","for","from","by","with","about",
-    "into","over","under","between","through",
-    "is","are","was","were","be","been","being","am",
-    "i","me","my","we","us","our","you","your","he","him","his","she","her",
-    "it","its","they","them","their",
-    "and","or","but","not","no","so","if","as","that","this","these","those",
-    "what","who","whom","when","where","why","how","which","whose",
-    "do","does","did","done","have","has","had","can","could","will","would",
-    "should","shall","may","might","must",
-    "tell","say","said","get","got","make","made","give","gave","know",
-    "all","any","some","many","much","few","more","most","other","another",
-    "very","just","also","than","then","there","here",
-}
-
-
-def _tokenize_for_bm25(query: str) -> list[str]:
-    """Sorguyu BM25 için içerik kelimelerine ayır (alphanumeric, ≥3 char)."""
-    tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
-    return [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS]
-
-
-def bm25_search(query: str, query_type: str | None = None,
-                matched_titles: list[str] | None = None,
-                top_k: int = HYBRID_POOL_SIZE) -> list[dict]:
-    """
-    SQLite FTS5 üzerinde BM25 ranking ile keyword araması.
-    Aynı metadata filtreleri (entity_type, matched titles) burada da uygulanır.
-    Eşleşme yoksa boş liste döner — hybrid füzyon dense'e geri düşer.
-    """
-    tokens = _tokenize_for_bm25(query)
-    if not tokens:
-        return []
-
-    # OR'lu sorgu: tek bir nadir keyword (e.g. "turkey") bile eşleşmeye yeter
-    fts_match = " OR ".join(tokens)
-
-    sql = [
-        "SELECT c.id, c.title, c.entity_type, c.chunk_index, c.chunk_text, "
-        "       bm25(chunks_fts) AS score",
-        "FROM chunks_fts",
-        "JOIN chunks c ON c.id = chunks_fts.rowid",
-        "WHERE chunks_fts MATCH ?",
-    ]
-    params: list = [fts_match]
-
-    if query_type in ("person", "place"):
-        sql.append("AND c.entity_type = ?")
-        params.append(query_type)
-
-    if matched_titles:
-        placeholders = ",".join("?" * len(matched_titles))
-        sql.append(f"AND c.title IN ({placeholders})")
-        params.extend(matched_titles)
-
-    sql.append("ORDER BY score LIMIT ?")
-    params.append(top_k)
-
-    conn = sqlite3.connect(SQLITE_DB_PATH)
-    try:
-        rows = conn.execute(" ".join(sql), params).fetchall()
-    except sqlite3.OperationalError as exc:
-        print(f"  [WARN] BM25 sorgusu basarisiz, dense-only: {exc}")
-        return []
-    finally:
-        conn.close()
-
-    return [
-        {
-            "chunk_id": r[0],
-            "title": r[1],
-            "entity_type": r[2],
-            "chunk_index": r[3],
-            "text": r[4],
-            "bm25_score": r[5],
-        }
-        for r in rows
-    ]
-
-
-def _rrf_combine(dense: list[dict], bm25_hits: list[dict],
-                 top_k: int = TOP_K, k: int = RRF_K) -> list[dict]:
-    """
-    Reciprocal Rank Fusion: aynı chunk iki listede varsa RRF puanları
-    toplanır.  k=60 literatür default'u, az sayıda sonuç için iyi çalışır.
-    """
-    pool: dict[int, dict] = {}
-
-    for rank, item in enumerate(dense, start=1):
-        cid = item["chunk_id"]
-        pool[cid] = {"item": item, "rrf": 1.0 / (k + rank)}
-
-    for rank, item in enumerate(bm25_hits, start=1):
-        cid = item["chunk_id"]
-        if cid in pool:
-            pool[cid]["rrf"] += 1.0 / (k + rank)
-        else:
-            pool[cid] = {"item": item, "rrf": 1.0 / (k + rank)}
-
-    ranked = sorted(pool.values(), key=lambda x: -x["rrf"])
-    return [entry["item"] for entry in ranked[:top_k]]
-
-
 def retrieve(query: str, query_type: str | None = None,
              top_k: int = TOP_K) -> list[dict]:
     """
-    Hybrid retrieval: dense (Chroma) + BM25 (SQLite FTS5) → RRF fusion.
+    Sorguya en yakın chunk'ları ChromaDB'den çeker.
 
-    Akış
-    ----
-    1. Router → query_type ve matched_titles
-    2. Dense: Chroma'dan HYBRID_POOL_SIZE chunk
-    3. BM25: SQLite FTS5'ten HYBRID_POOL_SIZE chunk (aynı metadata filtreleri)
-    4. RRF fusion → top_k
+    Parametreler
+    ------------
+    query      : Kullanıcı sorusu
+    query_type : "person" | "place" | "both" | None
+                 None ise otomatik route edilir.
+    top_k      : Döndürülecek sonuç sayısı
 
-    Dönüş: [{chunk_id, text, title, entity_type, chunk_index,
-             distance?, bm25_score?}, ...]
+    Dönüş
+    ------
+    [{"text": ..., "title": ..., "entity_type": ...,
+      "chunk_index": ..., "distance": ...}, ...]
     """
     if query_type is None:
         query_type = route_query(query)
 
-    matched_titles = match_entity_titles(query)
-
-    # ── Metadata filtreleri (her iki retrieval'da paylaşılır) ─
-    chroma_clauses = []
-    if query_type in ("person", "place"):
-        chroma_clauses.append({"entity_type": query_type})
-    if matched_titles:
-        if len(matched_titles) == 1:
-            chroma_clauses.append({"title": matched_titles[0]})
-        else:
-            chroma_clauses.append({"title": {"$in": matched_titles}})
-
-    if not chroma_clauses:
-        where_filter = None
-    elif len(chroma_clauses) == 1:
-        where_filter = chroma_clauses[0]
-    else:
-        where_filter = {"$and": chroma_clauses}
-
-    # ── 1) Dense (Chroma) ────────────────────────────────────
     collection = _get_collection()
     query_embedding = _embed_query(query)
 
+    # ── Metadata filtresi ────────────────────────────────────
+    # 1) entity_type (router kararına göre)
+    # 2) title (sorguda tam isim geçiyorsa, retrieval'i o sayfa(lar)a kilitle)
+    clauses = []
+    if query_type in ("person", "place"):
+        clauses.append({"entity_type": query_type})
+
+    matched_titles = match_entity_titles(query)
+    if matched_titles:
+        if len(matched_titles) == 1:
+            clauses.append({"title": matched_titles[0]})
+        else:
+            clauses.append({"title": {"$in": matched_titles}})
+
+    if not clauses:
+        where_filter = None
+    elif len(clauses) == 1:
+        where_filter = clauses[0]
+    else:
+        where_filter = {"$and": clauses}
+
+    # ── ChromaDB sorgusu ─────────────────────────────────────
     kwargs = {
         "query_embeddings": [query_embedding],
-        "n_results": HYBRID_POOL_SIZE,
+        "n_results": top_k,
         "include": ["documents", "metadatas", "distances"],
     }
     if where_filter:
         kwargs["where"] = where_filter
 
-    raw = collection.query(**kwargs)
+    results = collection.query(**kwargs)
 
-    dense_results = []
-    for cid, doc, meta, dist in zip(
-        raw["ids"][0], raw["documents"][0],
-        raw["metadatas"][0], raw["distances"][0],
+    # ── Sonuçları düzenle ────────────────────────────────────
+    retrieved = []
+    for doc, meta, dist in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
     ):
-        # Chroma id formati: "chunk_<sqlite_id>"
-        chunk_id = int(cid.replace("chunk_", "")) if cid.startswith("chunk_") else cid
-        dense_results.append({
-            "chunk_id": chunk_id,
+        retrieved.append({
             "text": doc,
             "title": meta["title"],
             "entity_type": meta["entity_type"],
@@ -364,23 +259,7 @@ def retrieve(query: str, query_type: str | None = None,
             "distance": dist,
         })
 
-    # ── 2) BM25 (SQLite FTS5) ────────────────────────────────
-    bm25_results = bm25_search(
-        query,
-        query_type=query_type,
-        matched_titles=matched_titles or None,
-        top_k=HYBRID_POOL_SIZE,
-    )
-
-    # ── 3) RRF fusion ────────────────────────────────────────
-    fused = _rrf_combine(dense_results, bm25_results, top_k=top_k, k=RRF_K)
-
-    # Sadece BM25'ten gelen item'lar 'distance' içermez — UI/API tutarlılığı için NaN backfill
-    for item in fused:
-        item.setdefault("distance", float("nan"))
-        item.setdefault("bm25_score", float("nan"))
-
-    return fused
+    return retrieved
 
 
 # ════════════════════════════════════════════════════════════
