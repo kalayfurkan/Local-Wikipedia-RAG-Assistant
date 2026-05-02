@@ -272,13 +272,34 @@ def save_document(title: str, entity_type: str, full_text: str,
 #  5.  ANA PIPELINE
 # ════════════════════════════════════════════════════════════
 
-def ingest_entity(title: str, entity_type: str):
-    """Tek bir Wikipedia varlığını ingest eder."""
+def is_already_ingested(title: str) -> bool:
+    """
+    SQLite'da bu başlık için zaten chunk'lı bir doküman var mı?
+    Re-run idempotent olsun diye: ingest.py tekrar çalıştırıldığında
+    Wikipedia'ya gereksiz istek atmayalım, sadece eksikleri çekelim.
+    """
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT chunk_count FROM documents WHERE title = ?", (title,)
+    ).fetchone()
+    conn.close()
+    return bool(row and row[0] > 0)
+
+
+def ingest_entity(title: str, entity_type: str) -> str:
+    """
+    Tek bir Wikipedia varlığını ingest eder. Zaten DB'de ise dokunmaz.
+    Dönüş: 'skipped' | 'fetched' | 'failed'  (run_ingest sleep yönetimi için)
+    """
+    if is_already_ingested(title):
+        print(f"  [SKIP] Zaten DB'de: {title}\n")
+        return "skipped"
+
     print(f"  [>] Fetching: {title} ...")
     raw = fetch_wikipedia_text(title)
     if not raw:
         print(f"  [!] Atlandi: {title}\n")
-        return
+        return "failed"
 
     text = clean_text(raw)
     print(f"      Temiz metin: {len(text):,} karakter")
@@ -289,25 +310,29 @@ def ingest_entity(title: str, entity_type: str):
 
     save_document(title, entity_type, text, chunks)
     print(f"  [OK] SQLite'a kaydedildi: {title}\n")
+    return "fetched"
 
 
 def run_ingest():
-    """Tum kisi ve yerleri ingest eder."""
+    """Tum kisi ve yerleri ingest eder. Re-run idempotent: zaten DB'de
+    olanları atlar, sadece eksikleri Wikipedia'dan çeker."""
     setup_database()
 
     print("=" * 60)
     print("  FAMOUS PEOPLE  (20)")
     print("=" * 60)
     for name in PEOPLE:
-        ingest_entity(name, "person")
-        time.sleep(2)   # Wikipedia rate-limit'e saygi   # Wikipedia rate-limit'e saygi
+        status = ingest_entity(name, "person")
+        if status == "fetched":
+            time.sleep(2)   # Wikipedia rate-limit'e saygi (sadece gerçek fetch sonrası)
 
     print("=" * 60)
     print("  FAMOUS PLACES  (20)")
     print("=" * 60)
     for name in PLACES:
-        ingest_entity(name, "place")
-        time.sleep(2)   # Wikipedia rate-limit'e saygi
+        status = ingest_entity(name, "place")
+        if status == "fetched":
+            time.sleep(2)
 
     # -- Ozet istatistik --
     conn = get_db_connection()

@@ -97,6 +97,8 @@ This will:
 - Clean and chunk the text (sentence-aware, 500 chars, 50 char overlap)
 - Store documents and chunks in a local SQLite file (`wiki_rag.db`, auto-created)
 
+> **Note:** If the run reports any `[!] Atlandi: <title>` lines (Wikipedia rate-limiting), simply re-run `python ingest.py`. Already-ingested entities are skipped automatically — only missing ones are fetched, so the second run completes in seconds.
+
 ### 4. Embed & Store in ChromaDB
 
 ```bash
