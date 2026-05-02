@@ -81,6 +81,19 @@ def _build_entity_lookup() -> tuple[dict[str, str], dict[str, str]]:
 
 ENTITY_MAP, WORD_MAP = _build_entity_lookup()
 
+# Lowercase isim → orijinal başlık (ChromaDB metadatasındaki casing)
+TITLE_LOOKUP = {n.lower(): n for n in PEOPLE + PLACES}
+
+
+def match_entity_titles(query: str) -> list[str]:
+    """
+    Sorguda tam adı geçen tüm bilinen varlıkların orijinal başlıklarını döner.
+    "Compare Albert Einstein and Nikola Tesla" → ["Albert Einstein", "Nikola Tesla"]
+    "What did she discover?" → []
+    """
+    q_lower = query.lower()
+    return [TITLE_LOOKUP[name] for name in ENTITY_MAP if name in q_lower]
+
 
 def route_query(query: str) -> str:
     """
@@ -200,10 +213,25 @@ def retrieve(query: str, query_type: str | None = None,
     query_embedding = _embed_query(query)
 
     # ── Metadata filtresi ────────────────────────────────────
-    where_filter = None
+    # 1) entity_type (router kararına göre)
+    # 2) title (sorguda tam isim geçiyorsa, retrieval'i o sayfa(lar)a kilitle)
+    clauses = []
     if query_type in ("person", "place"):
-        where_filter = {"entity_type": query_type}
-    # "both" → filtre yok, tüm koleksiyonda ara
+        clauses.append({"entity_type": query_type})
+
+    matched_titles = match_entity_titles(query)
+    if matched_titles:
+        if len(matched_titles) == 1:
+            clauses.append({"title": matched_titles[0]})
+        else:
+            clauses.append({"title": {"$in": matched_titles}})
+
+    if not clauses:
+        where_filter = None
+    elif len(clauses) == 1:
+        where_filter = clauses[0]
+    else:
+        where_filter = {"$and": clauses}
 
     # ── ChromaDB sorgusu ─────────────────────────────────────
     kwargs = {
