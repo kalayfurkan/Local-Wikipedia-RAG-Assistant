@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Local data (regenerable via ingest.py + embed_and_store.py)
+chroma_db/
+wiki_rag.db
+
+# Editor / OS / tooling
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
