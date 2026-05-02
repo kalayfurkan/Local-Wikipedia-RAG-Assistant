@@ -219,10 +219,38 @@ def setup_database():
         )
     """)
 
+    # ── chunks_fts: FTS5 BM25 keyword index (hybrid retrieval) ──
+    # External-content table: chunks_fts shadows chunks(id). Index manually
+    # rebuilt at end of ingest (no triggers needed, chunks are immutable
+    # within a session).
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            chunk_text,
+            title UNINDEXED,
+            entity_type UNINDEXED,
+            content='chunks',
+            content_rowid='id'
+        )
+    """)
+
     conn.commit()
     cursor.close()
     conn.close()
     print(f"[OK] SQLite veritabanı hazır: {SQLITE_DB_PATH}\n")
+
+
+def rebuild_fts_index():
+    """
+    chunks_fts'i chunks tablosundaki güncel içerikten yeniden inşa eder.
+    External-content FTS olduğu için INSERT/DELETE'ler otomatik yansımaz —
+    tüm ingest tamamlandıktan sonra bir kez çağırmak yeterli.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 
 def save_document(title: str, entity_type: str, full_text: str,
@@ -308,6 +336,10 @@ def run_ingest():
     for name in PLACES:
         ingest_entity(name, "place")
         time.sleep(2)   # Wikipedia rate-limit'e saygi
+
+    # FTS index'i yeniden inşa et (hybrid retrieval icin)
+    rebuild_fts_index()
+    print("[OK] FTS5 index yeniden insa edildi.\n")
 
     # -- Ozet istatistik --
     conn = get_db_connection()
