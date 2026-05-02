@@ -8,17 +8,41 @@
 # ============================================================
 
 import os
+import re
+import sqlite3
 import requests
 import chromadb
 from config import (
     OLLAMA_BASE_URL, OLLAMA_LLM_MODEL, OLLAMA_EMBED_MODEL,
-    PEOPLE, PLACES,
+    SQLITE_DB_PATH, PEOPLE, PLACES,
 )
 
 # ── ChromaDB ayarları ────────────────────────────────────────
 CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
 COLLECTION_NAME = "wiki_rag"
 TOP_K = 5   # Retrieve edilecek chunk sayısı
+
+# ── Discriminative-keyword fallback (PDF: keyword-based acceptable) ──
+# Sorguda entity ismi yoksa, içerik kelimelerini chunks.chunk_text'te LIKE ile
+# arar; az sayıda başlıkla eşleşen ayırt edici kelimelerin başlık kümesini
+# Chroma'ya title filtresi olarak gönderir.
+DISCRIMINATIVE_TITLE_LIMIT = 5   # Token bu kadar veya daha az başlıkla eşleşirse "ayırt edici"
+
+_GENERIC_QUERY_WORDS = {
+    "the","a","an","of","in","on","at","to","for","is","are","was","were",
+    "be","been","being","and","or","but","that","this","these","those",
+    "what","who","whom","when","where","why","how","which","whose",
+    "do","does","did","have","has","had","can","could","will","would",
+    "should","shall","may","might","must",
+    "i","me","my","we","us","our","you","your","he","him","his","she","her",
+    "it","its","they","them","their",
+    "tell","say","said","get","got","make","made","give","gave","know",
+    "all","any","some","many","much","few","more","most","other","another",
+    "very","just","also","than","then","there","here","with","from","by","about",
+    "into","over","under","between","through","not","no",
+    # Bu projede her chunk'ta geçtiği için ayırt edici değil:
+    "famous","place","person","people","known",
+}
 
 
 # ════════════════════════════════════════════════════════════
@@ -93,6 +117,47 @@ def match_entity_titles(query: str) -> list[str]:
     """
     q_lower = query.lower()
     return [TITLE_LOOKUP[name] for name in ENTITY_MAP if name in q_lower]
+
+
+def discriminative_title_filter(query: str) -> list[str]:
+    """
+    Sadece entity ismi geçmeyen sorgular için fallback (rule-based).
+
+    Akış
+    ----
+    1. Sorguyu içerik kelimelerine ayır (≥4 char, generic değil).
+    2. Her kelime için chunks.chunk_text içinde LIKE araması yap →
+       o kelimeyi geçiren benzersiz başlıkları bul.
+    3. Az başlıkla eşleşen (≤ DISCRIMINATIVE_TITLE_LIMIT) "ayırt edici"
+       kelimelerin başlık kümelerini birleştir.
+    4. Çıkan başlıkları Chroma'ya title filtresi olarak ver.
+
+    Örnek: "Which famous place is located in Turkey?"
+      → "turkey" → {"Hagia Sophia", "Galata Tower"} (ayırt edici)
+      → "located" → 30+ başlık (generic, atlanır)
+    """
+    tokens = re.findall(r"[a-zA-Z]+", query.lower())
+    tokens = [t for t in tokens if len(t) >= 4 and t not in _GENERIC_QUERY_WORDS]
+    if not tokens:
+        return []
+
+    candidates: set[str] = set()
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    try:
+        for tok in tokens:
+            rows = conn.execute(
+                "SELECT DISTINCT title FROM chunks "
+                "WHERE chunk_text LIKE ? COLLATE NOCASE",
+                (f"%{tok}%",),
+            ).fetchall()
+            titles = {r[0] for r in rows}
+            # Sadece "ayırt edici" kelimeleri kullan; jenerik/yaygın olanı atla
+            if 1 <= len(titles) <= DISCRIMINATIVE_TITLE_LIMIT:
+                candidates.update(titles)
+    finally:
+        conn.close()
+
+    return sorted(candidates)
 
 
 def route_query(query: str) -> str:
@@ -214,12 +279,17 @@ def retrieve(query: str, query_type: str | None = None,
 
     # ── Metadata filtresi ────────────────────────────────────
     # 1) entity_type (router kararına göre)
-    # 2) title (sorguda tam isim geçiyorsa, retrieval'i o sayfa(lar)a kilitle)
+    # 2) title:
+    #    a) sorguda tam entity ismi varsa → o sayfa(lar)a kilitle
+    #    b) yoksa, ayırt edici keyword'lerden başlık çıkar (LIKE fallback)
     clauses = []
     if query_type in ("person", "place"):
         clauses.append({"entity_type": query_type})
 
     matched_titles = match_entity_titles(query)
+    if not matched_titles:
+        matched_titles = discriminative_title_filter(query)
+
     if matched_titles:
         if len(matched_titles) == 1:
             clauses.append({"title": matched_titles[0]})
