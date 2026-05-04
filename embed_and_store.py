@@ -91,36 +91,52 @@ def fetch_chunks_from_db() -> list[dict]:
 #  3.  CHROMADB'YE KAYDET  (Tek koleksiyon + metadata)
 # ════════════════════════════════════════════════════════════
 
-def get_chroma_collection() -> chromadb.Collection:
+def chroma_id(chunk: dict) -> str:
     """
-    Kalıcı (persistent) ChromaDB client oluşturur ve
-    'wiki_rag' koleksiyonunu döner.  Koleksiyon yoksa yaratılır.
+    Stable Chroma ID. SQLite chunk.id AUTOINCREMENT yuzunden re-ingest
+    sonrasi degisebilir; (title, chunk_index) cifti dokuman tekrar
+    islense de ayni kalir → duplikasyon riski yok.
+    """
+    return f"{chunk['title']}::{chunk['chunk_index']}"
+
+
+def get_chroma_collection(rebuild: bool = False) -> chromadb.Collection:
+    """
+    Kalıcı (persistent) ChromaDB client oluşturur ve 'wiki_rag' koleksiyonunu döner.
+
+    rebuild=False (varsayılan): Mevcut koleksiyon korunur, incremental ekleme.
+    rebuild=True (--rebuild flag): Koleksiyon silinip baştan kurulur.
     """
     client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 
-    # Varsa sil, temiz basla  (idempotent re-run)
-    existing = [c.name for c in client.list_collections()]
-    if COLLECTION_NAME in existing:
-        client.delete_collection(COLLECTION_NAME)
-        print(f"  [DEL] Eski koleksiyon silindi: {COLLECTION_NAME}")
+    if rebuild:
+        existing = [c.name for c in client.list_collections()]
+        if COLLECTION_NAME in existing:
+            client.delete_collection(COLLECTION_NAME)
+            print(f"  [DEL] Eski koleksiyon silindi (--rebuild): {COLLECTION_NAME}")
 
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},   # Cosine benzerlik
+        metadata={"hnsw:space": "cosine"},
     )
-    print(f"  [OK] Koleksiyon olusturuldu: {COLLECTION_NAME}  (cosine)\n")
+    print(f"  [OK] Koleksiyon hazir: {COLLECTION_NAME}  (cosine, mevcut={collection.count()})\n")
     return collection
+
+
+def filter_new_chunks(chunks: list[dict],
+                      collection: chromadb.Collection) -> list[dict]:
+    """ChromaDB'de zaten olan ID'leri filtreleyip yalnizca yenileri dondur."""
+    if collection.count() == 0:
+        return chunks
+    all_ids = [chroma_id(c) for c in chunks]
+    existing = set(collection.get(ids=all_ids)["ids"])
+    return [c for c in chunks if chroma_id(c) not in existing]
 
 
 def store_in_chroma(chunks: list[dict], collection: chromadb.Collection):
     """
-    Chunk'lari batch'ler halinde embed edip ChromaDB'ye yazar.
-
-    Her chunk icin metadata:
-      - entity_type : "person" | "place"
-      - title       : Orijinal Wikipedia basligi
-      - chunk_index : Dokuman icindeki sira numarasi
-      - document_id : MySQL document ID
+    Verilen chunk listesini batch'ler halinde embed edip ChromaDB'ye yazar.
+    Caller tarafindan filter_new_chunks ile filtrelenmis olmali.
     """
     total = len(chunks)
     stored = 0
@@ -137,8 +153,7 @@ def store_in_chroma(chunks: list[dict], collection: chromadb.Collection):
         elapsed = time.time() - t0
         print(f"      Embedding suresi: {elapsed:.1f}s")
 
-        # -- ChromaDB'ye ekle --
-        ids = [f"chunk_{c['id']}" for c in batch]
+        ids = [chroma_id(c) for c in batch]
         metadatas = [
             {
                 "entity_type": c["entity_type"],
@@ -212,12 +227,15 @@ def verify_collection(collection: chromadb.Collection):
 #  5.  ANA AKIS
 # ================================================================
 
-def run_embed_and_store():
+def run_embed_and_store(rebuild: bool = False):
+    """
+    Incremental mode (default): SQLite'da olup ChromaDB'de olmayan chunk'lari embed eder.
+    --rebuild flag'i ile: tum koleksiyonu silip bastan kurar.
+    """
     print("=" * 60)
-    print("  EMBED & STORE PIPELINE")
+    print(f"  EMBED & STORE PIPELINE  ({'REBUILD' if rebuild else 'INCREMENTAL'})")
     print("=" * 60 + "\n")
 
-    # 1. SQLite'dan chunk'lari oku
     print("  [..] SQLite'dan chunk'lar okunuyor...")
     chunks = fetch_chunks_from_db()
     if not chunks:
@@ -225,19 +243,29 @@ def run_embed_and_store():
         sys.exit(1)
     print(f"  [OK] {len(chunks)} chunk okundu.\n")
 
-    # 2. ChromaDB koleksiyonunu hazirla
-    collection = get_chroma_collection()
+    collection = get_chroma_collection(rebuild=rebuild)
 
-    # 3. Embed & store
-    stored = store_in_chroma(chunks, collection)
+    if rebuild:
+        new_chunks = chunks
+    else:
+        new_chunks = filter_new_chunks(chunks, collection)
+        skipped = len(chunks) - len(new_chunks)
+        print(f"  [INC] ChromaDB'de zaten {skipped} chunk var, "
+              f"yeni embed edilecek: {len(new_chunks)}\n")
 
-    # 4. Dogrulama
+    if not new_chunks:
+        print("  [OK] Tum chunk'lar zaten ChromaDB'de.")
+        verify_collection(collection)
+        return
+
+    stored = store_in_chroma(new_chunks, collection)
     verify_collection(collection)
 
-    print(f"\n  [OK] Toplam {stored} chunk basariyla ChromaDB'ye kaydedildi.")
+    print(f"\n  [OK] {stored} yeni chunk eklendi  (toplam: {collection.count()}).")
     print(f"  [DIR] Veri dizini: {CHROMA_PERSIST_DIR}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    run_embed_and_store()
+    rebuild = "--rebuild" in sys.argv
+    run_embed_and_store(rebuild=rebuild)
