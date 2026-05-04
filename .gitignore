@@ -6,9 +6,9 @@ __pycache__/
 .venv/
 venv/
 
-# Local data (regenerable via ingest.py + embed_and_store.py)
-chroma_db/
-wiki_rag.db
+# NOT: chroma_db/ ve wiki_rag.db repo'ya dahil edildi —
+# instructor ingest+embed adimlarini atlayip dogrudan UI'i baslatabilsin diye.
+# Sifirdan kurmak icin: silip 'python ingest.py && python embed_and_store.py' calistir.
 
 # Editor / OS / tooling
 .claude/

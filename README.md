@@ -86,7 +86,9 @@ cd Local-Wikipedia-RAG-Assistant
 pip install -r requirements.txt
 ```
 
-### 3. Ingest Wikipedia Data
+> 🚀 **Shortcut:** This repo ships with a pre-built `wiki_rag.db` (SQLite) and `chroma_db/` (vectors), so you can **skip steps 3 and 4** and jump straight to step 5. They are included for convenience — only run steps 3-4 if you want to regenerate from scratch or extend the entity list.
+
+### 3. Ingest Wikipedia Data (optional — pre-built DB included)
 
 ```bash
 python ingest.py
@@ -99,10 +101,11 @@ This will:
 
 > **Note:** If the run reports any `[!] Atlandi: <title>` lines (Wikipedia rate-limiting), simply re-run `python ingest.py`. Already-ingested entities are skipped automatically — only missing ones are fetched, so the second run completes in seconds.
 
-### 4. Embed & Store in ChromaDB
+### 4. Embed & Store in ChromaDB (optional — pre-built collection included)
 
 ```bash
-python embed_and_store.py
+python embed_and_store.py            # incremental: only new chunks
+python embed_and_store.py --rebuild  # full rebuild from scratch
 ```
 
 This will:
