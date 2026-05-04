@@ -80,8 +80,8 @@ ollama pull nomic-embed-text
 ### 2. Clone & Install Dependencies
 
 ```bash
-git clone <your-repo-url>
-cd hw3
+git clone https://github.com/kalayfurkan/Local-Wikipedia-RAG-Assistant.git
+cd Local-Wikipedia-RAG-Assistant
 
 pip install -r requirements.txt
 ```
@@ -189,7 +189,7 @@ All settings are in `config.py`:
 ## 📁 Project Structure
 
 ```
-hw3/
+Local-Wikipedia-RAG-Assistant/
 ├── config.py              # Central configuration
 ├── ingest.py              # Wikipedia ingestion + native chunking
 ├── embed_and_store.py     # Embedding + ChromaDB storage
@@ -207,7 +207,9 @@ hw3/
 
 ## 📹 Demo Video
 
-_To be added before submission — Loom or unlisted YouTube link covering: system overview, live ingestion + Q&A, model and retrieval choices, tradeoffs, possible improvements (per assignment spec, ≤5 minutes)._
+**▶ Watch the 5-minute demo on YouTube:** https://www.youtube.com/watch?v=xu9bivuu-ok
+
+The video covers: system overview, live ingestion + Q&A, model and retrieval choices, tradeoffs, and possible improvements.
 
 ---
 
